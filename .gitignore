@@ -8,3 +8,7 @@ pytest.ini
 package-lock.json
 dist/
 .pytest_cache/
+media/
+.env
+.env.*
+!.env.example

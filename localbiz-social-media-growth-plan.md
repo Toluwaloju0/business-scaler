@@ -255,7 +255,7 @@ The app should:
 
 The current implementation provides a deterministic baseline for these phases:
 
-- Source assets can be listed per business profile, explicitly selected, and ranked using profile-text overlap and available asset metadata.
+- Source assets can be listed per business profile, explicistly selected, and ranked using profile-text overlap and available asset metadata.
 - The generation request can choose one of the supported creative formats or select a starting format from the selected asset types.
 - Exactly three draft variations are returned per requested platform, including a hook, caption, CTA, on-screen text, aspect ratio, duration guidance, and platform format.
 - Each draft records the selected asset IDs it was based on. The response identifies the ranking source and explicitly reports that live trend data is not connected.
@@ -557,3 +557,133 @@ The best way to deliver this product successfully is to treat it as an AI-assist
 - mobile-first usability
 
 If implemented in this order, the app will be useful quickly, while still leaving room for advanced automation and analytics later.
+
+---
+
+## 13. Phase 2 database and persistence implementation plan
+
+### 13.1 Goals and boundaries
+
+Phase 2 persistence must replace the current process-local dictionaries without changing the existing API's business workflow. A restart must not lose users, businesses, profiles, uploaded text, asset metadata, generated drafts, sessions, or analytics. Uploaded binary media belongs in private object storage; PostgreSQL stores its ownership, object key, metadata, processing state, extracted text, and references. Do not store large image/video/PDF binaries in PostgreSQL.
+
+The database URL is required configuration, not an optional fallback. The backend must load it from the process environment or project `.env`, validate it before serving requests, and stop startup with a clear configuration error if it is absent, blank, malformed, or has an unsupported scheme. Never print the URL or its credentials in logs.
+
+### 13.2 Initial technology and configuration decisions
+
+- PostgreSQL is the system of record; use SQLAlchemy 2.x ORM with synchronous sessions initially because the current FastAPI route handlers are synchronous. Use Alembic for all schema changes; do not use `create_all()` as a production migration strategy.
+- Use a PostgreSQL driver supported by the selected SQLAlchemy version. Normalize accepted URL schemes in one settings module, and keep connection construction out of route handlers.
+- Load settings through a typed settings class that reads `.env` and real environment variables, with real environment variables taking precedence. Make the URL field required and validate PostgreSQL scheme/driver and non-whitespace value. Fail fast during application startup and provide a separate database readiness check that does not expose credentials.
+- Commit `.env.example` with variable names and safe placeholders only. Add `.env`, local database files, and test secrets to `.gitignore`; never commit real credentials. Use separate development, test, staging, and production databases.
+- Use PostgreSQL `pgvector` for embeddings in the initial RAG implementation so relational tenant filters and vector retrieval share one authorization boundary. Keep the embedding provider/model and vector size recorded with each embedding so the model can be changed through a deliberate re-embedding migration.
+- Use an S3-compatible private object store for binary uploads. Store bucket/object key and checksums in PostgreSQL; keep credentials in the same environment/secret-manager configuration, not in the database or mobile bundle.
+
+### 13.3 ORM entities and relationships
+
+All user-owned rows must include or be reachable through an immutable owner/business relationship. Add database foreign keys, uniqueness constraints, indexes, timestamps, and deletion behavior explicitly. Use UUID primary keys for public entities; avoid exposing sequential database IDs.
+
+| Entity | Purpose and important fields |
+| --- | --- |
+| `User` | `id` (the stable `user_id` referenced by profiles and sessions), `display_name`, `is_active`, timestamps. This user-reference model does not contain a password or password hash. |
+| `Business` | `id`, `name`, niche, location, services, target audience, tone, goals, brand settings, timestamps. This replaces the business profile record as durable data. |
+| `BusinessMembership` | `user_id`, `business_id`, role, invited/accepted timestamps; unique pair. Enables team access while keeping authorization business-scoped. |
+| `AuthSession` | `id`, `user_id` foreign key, created/expiry/revocation timestamps, optional non-sensitive device metadata. The session references the user by `user_id` and contains no password or `password_hash`; credentials are not profile/session fields. |
+| `SocialAccount` | `business_id`, platform, external account ID/name, granted scopes, connection state, token ciphertext/reference, token expiry. Unique platform/account per business; never return credentials from API responses. |
+| `ContentAsset` | `id`, `business_id`, creator user, kind, title, source text, description, original filename, validated MIME type, byte size, SHA-256 checksum, private object key, status, error, upload timestamp. Text-only records may have no object key. |
+| `AssetDerivative` | `asset_id`, derivative kind, private object key, MIME type, dimensions/duration, checksum, processing status. Stores thumbnails, normalized media, and extracted frames separately from originals. |
+| `AssetAnalysis` | `asset_id`, processor/model version, extracted text/OCR/transcript, tags, quality/subject scores, analysis state, timestamps. Preserve provenance and permit reprocessing. |
+| `ContentChunk` | `business_id`, optional `asset_id` or `draft_id`, ordinal, text, source metadata, embedding model/version, vector. Chunks always carry business scope for filtered retrieval. |
+| `GeneratedDraft` | `id`, `business_id`, creator, platform, selected asset references, creative format, hook, caption, CTA, overlays, production specs, status, generation/model version, timestamps. Draft remains distinct from a published post. |
+| `ContentRating` | `business_id`, `draft_id`/published content reference, user, rating, optional reason, created/updated timestamps. One explicit rating per user and content item; supports user feedback without treating popularity as quality. |
+| `PublishedPost` | `business_id`, social account, source draft, external post ID, platform, publish state/timestamps, request/idempotency key, failure code/message. |
+| `PostPerformanceSnapshot` | `published_post_id`, captured time, impressions/reach/views/likes/comments/shares/saves/clicks/conversions/followers as nullable counters, platform, raw-source version. Use snapshots to calculate rates over time rather than overwrite history. |
+| `ProcessingJob` | `business_id`, optional `asset_id`, job type, state, attempt count, retry time, safe error code, started/completed timestamps. Makes extraction and embedding work resumable and idempotent. |
+| `AuditEvent` | actor, business, action, subject, timestamp, request correlation ID, non-sensitive metadata. Never include access tokens, passwords, or uploaded content bodies. |
+
+For asset-to-draft and draft-to-published relationships, use explicit association tables where one draft can cite several assets or a post can be derived from several drafts. Add indexes for owner/business foreign keys, status, created time, expiry, platform/external ID, and common filtered retrieval columns.
+
+### 13.4 Session authentication and authorization
+
+1. The current Phase 2 identity flow uses a stable `user_id` generated once by the client and persisted locally; the backend profile endpoint accepts it and associates the generated profile with it. No password or password hash is part of the profile or session payload.
+2. The session record references its user only through `user_id`; lifecycle timestamps and non-sensitive device metadata may be stored separately. Never put password material in a session record.
+3. `POST /api/v1/business-profile` checks for an existing profile by `user_id`. If found, it returns that stored profile unchanged; otherwise it creates a new profile and returns the generated profile ID plus `user_id`. Keep `POST /api/v1/business-profiles/` as a compatibility alias during migration.
+4. Business-scoped routes resolve records through the returned profile ID and, once membership authorization is implemented, verify that the active session's `user_id` owns or belongs to that profile. Use 404 for inaccessible resources where that avoids leaking resource existence.
+5. A client-generated `user_id` is an identifier, not proof of identity: this no-password MVP upsert is not authentication and is vulnerable to spoofing if exposed publicly. Before production, bind `user_id` to a verified sign-in/session mechanism and enforce ownership server-side; keep any authentication credential separate from profile/session business fields.
+
+### 13.5 Upload persistence and processing workflow
+
+1. Authenticate and authorize the business before accepting an upload. Enforce allow-listed MIME types/extensions, maximum byte size, filename normalization, and per-business quota. Do not trust the client MIME type alone; verify file signatures where practical.
+2. Create a pending `ContentAsset` record, compute/check SHA-256, and upload the original to a private object key that is not derived directly from the user filename. For direct-to-object-store mobile upload, issue a short-lived presigned upload URL and require a finalize call to verify size/checksum before marking the asset uploaded.
+3. On any upload/storage failure, mark the record failed or remove the pending record and any partial object; retries must be safe and idempotent. Never leave an asset reported as ready when its object is missing.
+4. Store text-only submissions as `ContentAsset.source_text`; treat OCR, PDF text, transcripts, video frames, thumbnails, and embeddings as asynchronous derivatives/analysis with explicit pending/ready/failed states.
+5. Queue processing work using `ProcessingJob` and an outbox/transactional job record so database commits cannot silently lose work. Initial implementation may poll jobs without Redis; add Redis/Celery only when asynchronous processing is introduced.
+6. Implement deletion as an authorized lifecycle: mark deletion requested, remove object and derivatives, then delete or tombstone database rows according to audit/retention requirements. Define retention and user export behavior before production.
+
+### 13.6 RAG over highly rated content
+
+- Index only content the current business is permitted to use: their uploaded notes, their own generated drafts, and their own published posts by default. Cross-business/global reuse is prohibited unless there is explicit opt-in, appropriate anonymization, and a documented rights basis.
+- Build retrieval chunks from extracted asset text, approved drafts, and published post text. Attach `business_id`, source type/ID, platform, created/published time, consent/visibility state, embedding model/version, and chunk number to every chunk.
+- Maintain explicit user ratings separately from observed post performance. Normalize engagement by available denominator (for example, engagement per reach or view) and compare within compatible platform/content format/time windows. Apply a minimum-volume threshold and Bayesian smoothing so tiny samples or one viral post do not dominate. Missing metrics remain unknown, not zero.
+- Candidate retrieval first hard-filters by authenticated business, visibility/consent, platform compatibility, and eligible state; then performs vector similarity. Re-rank the small candidate set using semantic similarity, explicit quality rating, smoothed normalized performance, freshness, and content suitability. Store the ranking explanation and source IDs with the generation job for auditability.
+- The generation prompt may use retrieved posts as examples of tone and effective structure, not as text to copy. Return source references with analysis so the app can show why examples were selected. Do not claim that a high historical score guarantees future performance.
+- Test RAG isolation with two businesses containing near-identical queries and high-rated content; assert that no content, chunk, embedding, or citation from the other business is returned. Also test empty history, missing metrics, changed embedding versions, and stale/deleted source invalidation.
+
+### 13.7 Delivery sequence
+
+1. **Configuration gate:** add typed settings, `.env.example`, `.gitignore` safeguards, and tests proving `DATABASE_URL` is loaded from `.env`, overridden by the real environment, rejected when missing/blank/unsupported, and never logged.
+2. **Database foundation:** add SQLAlchemy engine/session lifecycle, request-scoped unit-of-work dependency, health/readiness checks, Alembic, first migration, and disposable PostgreSQL test configuration. App startup must fail clearly when configuration is absent or the database cannot be reached.
+3. **Identity and session:** implement User, Business, BusinessMembership, and AuthSession ORM models/repositories with sessions referencing users by `user_id` and no password/password-hash fields in session data; add profile lookup-or-create by user ID and authorization tests. Add a verified authentication mechanism before public production use. Preserve the legacy plural profile path as a compatibility alias.
+4. **Asset persistence:** implement ContentAsset/AssetDerivative/AssetAnalysis/ProcessingJob records and private storage adapter. Persist text assets first; add image/video/PDF upload, finalize, metadata validation, checksum, failure cleanup, and retry behavior.
+5. **Draft and performance history:** persist generated drafts, ratings, published-post references, and append-only performance snapshots. Keep external publishing disabled until authenticated consent and phase-6 review controls exist.
+6. **Retrieval foundation:** install/enable pgvector, persist versioned embeddings and chunks, add business-filtered top-k retrieval, relevance/rating/performance reranking, source attribution, and cross-tenant tests. Start with seeded fixtures and explicit ratings; introduce live engagement inputs only when available.
+7. **Cutover and verification:** move current in-memory profile/account/asset endpoints to database-backed repositories without changing response fields unnecessarily; run migrations on a fresh test database; verify restart persistence, backup/restore, and no secrets in logs before using a non-test database.
+
+### 13.8 Phase 2 testing and exit criteria
+
+**Configuration and schema tests**
+
+- Startup rejects absent, whitespace-only, malformed, and unsupported `DATABASE_URL`; accepts a valid PostgreSQL URL loaded from `.env`; process environment overrides `.env`.
+- Alembic can build a fresh database to head and upgrade a previous supported schema. Migration tests run against PostgreSQL, not SQLite, for PostgreSQL types/extensions and constraint behavior.
+- All owner relationships, uniqueness rules, delete behavior, and indexes are verified at the database boundary.
+
+**Identity and isolation tests**
+
+- Repeated profile POSTs for the same `user_id` return the same profile; a different `user_id` cannot resolve that profile. Session lifecycle and ownership tests must confirm there are no password/password-hash fields in session records.
+- A user cannot list, retrieve, modify, upload to, or retrieve RAG context from another business without membership; forged owner IDs are ignored.
+- Social credentials are encrypted or stored by a secret reference and are never returned in API responses or written to logs.
+
+**Phase 2 upload tests**
+
+- Valid text and allowed image/video/PDF uploads produce durable records; binary bytes are in object storage and the matching private object key/checksum/size is in the database.
+- Unsupported format, mismatched MIME/signature, excessive size/quota, duplicate checksum, missing object, storage timeout, and interrupted upload produce an understandable error and no ready-but-broken asset.
+- OCR/transcript/extraction job retries are idempotent; processing status and failure are visible; deleting an asset removes or invalidates its derivatives/chunks.
+- Restart the API between write and read operations and confirm the profile, memberships, asset metadata, and text content persist.
+
+**Phase 2 exit criteria**
+
+- App startup demonstrably refuses to run without a loaded, valid database URL.
+- A user can authenticate, create a business, upload text and a media file, restart the API, and retrieve only their authorized records.
+- Media is private and retrievable only through authorized, time-limited access; upload failure cleanup is covered by integration tests.
+- RAG may remain behind a feature flag until embeddings are available, but schema, tenant filters, explicit rating/performance signals, source attribution, and isolation tests are in place before enabling it.
+
+### 13.9 Risks and decisions to settle before implementation
+
+- **Credential handling:** determine password-only, email-link, or third-party sign-in policy and account recovery before exposing registration publicly.
+- **Object storage:** select the actual S3-compatible provider and define private bucket CORS, encryption, lifecycle, maximum upload size, and backup policy. Do not put object-store secrets in Expo public variables.
+- **RAG data rights:** decide whether ratings and retrieval are business-private only; default to private per business. Do not train a shared/global corpus from customer data without explicit consent.
+- **Engagement comparability:** platform metrics and denominators differ; document normalization, minimum sample size, time windows, and how missing/private platform metrics are handled.
+- **Database and test services:** local development and CI need a disposable PostgreSQL instance with the same extensions as production; tests must never use a developer's or production database.
+- **Current local profile cache:** keep AsyncStorage limited to non-secret offline form convenience. Once authenticated sync is implemented, reconcile local drafts by stable client-generated IDs and show pending/synced/failed states rather than treating the cache as the source of truth.
+
+### 13.10 Initial implementation status
+
+The first database and media-upload foundation has now been added to the repository:
+
+- `app/settings.py` loads `DATABASE_URL` from `.env`/the environment, rejects missing, blank, malformed, and non-PostgreSQL URLs, and keeps the value secret when represented in settings.
+- `app/database.py` creates SQLAlchemy engine/session dependencies lazily; importing the app does not establish a database connection.
+- `app/models.py` defines UUID-backed ORM metadata for users, businesses, memberships, user-ID-only sessions, social accounts, content assets and derivatives/analysis, drafts, draft-asset links, ratings, published posts, performance snapshots, vector chunks, processing jobs, and audit events. Session columns contain no password or password hash.
+- `.env.example` is a template only and must be copied/configured with a real PostgreSQL URL by the developer. The checked-out workspace had no `.env` or `DATABASE_URL`; no working database credential has been fabricated.
+- Alembic configuration and an environment scaffold are present. A real first schema revision and `pgvector` extension creation still require a configured disposable PostgreSQL instance.
+- `GET /ready` verifies that the required configuration loads without returning the database URL.
+- The frontend now has a bottom navigation entry and a media page using Expo ImagePicker for multiple image/video selections. The FastAPI media endpoint validates an allow-listed MIME type and configured byte limit, computes SHA-256, uses a generated filename, and saves to the configured local media directory.
+
+**Important current boundary:** the legacy profile, social-account, and content-asset APIs still use process-local dictionaries; the new ORM models are not yet connected to those routes, and Alembic migrations have not been generated/applied. The media upload endpoint currently writes files to local disk and its metadata to the in-memory asset dictionary; it is development-only, not durable database/object-store persistence. The app refuses startup without a valid `.env`/environment URL, and this workspace requires the developer to configure that URL before running Uvicorn. Model inference/asset analysis is not yet implemented: uploads are available as future model inputs, but the screen does not claim the open-weight model has analyzed them yet.

@@ -1,4 +1,8 @@
+import os
+
 from fastapi.testclient import TestClient
+
+os.environ.setdefault("DATABASE_URL", "postgresql+psycopg://test:test@localhost/test_db")
 
 from app.main import app
 
@@ -25,6 +29,55 @@ def test_business_profile_creation_and_fetch():
     fetch_response = client.get(f"/api/v1/business-profiles/{business['id']}")
     assert fetch_response.status_code == 200
     assert fetch_response.json()["business_name"] == payload["business_name"]
+
+
+def test_business_profile_post_returns_existing_profile_for_same_user():
+    user_id = "test-user-profile-upsert"
+    payload = {
+        "user_id": user_id,
+        "business_name": "Returning Customer Cafe",
+        "niche": "Cafe",
+        "location": "Seattle",
+        "service_offerings": "Coffee and pastries",
+        "target_audience": "Nearby residents",
+        "brand_tone": "Warm",
+        "posting_goals": "Increase morning visits",
+    }
+
+    first_response = client.post("/api/v1/business-profile", json=payload)
+    second_response = client.post(
+        "/api/v1/business-profile",
+        json={**payload, "business_name": "Changed Name Should Not Replace Existing"},
+    )
+
+    assert first_response.status_code == 200
+    assert second_response.status_code == 200
+    assert first_response.json()["id"] == second_response.json()["id"]
+    assert second_response.json()["user_id"] == user_id
+    assert second_response.json()["business_name"] == payload["business_name"]
+
+
+def test_business_profile_post_creates_separate_profiles_for_different_users():
+    payload = {
+        "business_name": "Shared Name Studio",
+        "niche": "Photography",
+        "location": "Seattle",
+        "service_offerings": "Portrait sessions",
+        "target_audience": "Local families",
+        "brand_tone": "Friendly",
+        "posting_goals": "Book more sessions",
+    }
+
+    first = client.post(
+        "/api/v1/business-profile", json={**payload, "user_id": "profile-owner-a"}
+    ).json()
+    second = client.post(
+        "/api/v1/business-profile", json={**payload, "user_id": "profile-owner-b"}
+    ).json()
+
+    assert first["id"] != second["id"]
+    assert first["user_id"] == "profile-owner-a"
+    assert second["user_id"] == "profile-owner-b"
 
 
 def test_social_account_connection_and_content_asset_upload():
@@ -231,3 +284,64 @@ def test_phase_5_rejects_unknown_format_and_returns_three_drafts_without_assets(
     assert len(generated.json()["platforms"][0]["suggestions"]) == 3
     assert generated.json()["platforms"][0]["suggestions"][0]["platform_format"] == "Short video"
     assert invalid.status_code == 422
+
+
+def test_media_upload_rejects_unsupported_file_type():
+    profile_response = client.post(
+        "/api/v1/business-profile",
+        json={
+            "user_id": "media-upload-user",
+            "business_name": "Media Studio",
+            "niche": "Photography",
+            "location": "Seattle",
+            "service_offerings": "Portraits",
+            "target_audience": "Local families",
+            "brand_tone": "Friendly",
+            "posting_goals": "Book more sessions",
+        },
+    )
+    profile_id = profile_response.json()["id"]
+
+    response = client.post(
+        f"/api/v1/business-profiles/{profile_id}/media-assets",
+        files={"file": ("notes.txt", b"not media", "text/plain")},
+    )
+
+    assert response.status_code == 415
+
+
+def test_database_settings_require_postgresql_url():
+    import pytest
+
+    from pydantic import ValidationError
+
+    from app.settings import Settings
+
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, DATABASE_URL="")
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, DATABASE_URL="sqlite:///local.db")
+
+    settings = Settings(
+        _env_file=None,
+        DATABASE_URL="postgresql+psycopg://test:test@localhost/test_db",
+    )
+    assert settings.database_url.get_secret_value().startswith("postgresql+psycopg://")
+
+
+def test_orm_metadata_includes_persistence_entities_and_password_free_sessions():
+    from app.models import AuthSession, Base
+
+    assert "users" in Base.metadata.tables
+    assert "content_assets" in Base.metadata.tables
+    assert "content_chunks" in Base.metadata.tables
+    assert "post_performance_snapshots" in Base.metadata.tables
+    assert {column.name for column in AuthSession.__table__.columns} == {
+        "id",
+        "user_id",
+        "created_at",
+        "expires_at",
+        "revoked_at",
+        "last_used_at",
+        "device_label",
+    }

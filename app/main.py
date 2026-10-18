@@ -1,12 +1,23 @@
 from __future__ import annotations
 
 import re
+from contextlib import asynccontextmanager
+from hashlib import sha256
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 from uuid import uuid4
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, File, HTTPException, UploadFile
 from pydantic import BaseModel, Field
 
+from app.settings import get_settings
+
+@asynccontextmanager
+async def lifespan(_: FastAPI):
+    get_settings()
+    yield
+
+app = FastAPI(title="LocalBiz Social Growth App", version="0.1.0", lifespan=lifespan)
 app = FastAPI(title="LocalBiz Social Growth App", version="0.1.0")
 
 
@@ -16,6 +27,7 @@ content_assets_db: Dict[str, Dict[str, Any]] = {}
 
 
 class BusinessProfileCreate(BaseModel):
+    user_id: Optional[str] = Field(default=None, min_length=1)
     business_name: str = Field(..., min_length=2)
     niche: str = Field(..., min_length=2)
     location: str = Field(..., min_length=2)
@@ -27,6 +39,7 @@ class BusinessProfileCreate(BaseModel):
 
 class BusinessProfile(BusinessProfileCreate):
     id: str
+    user_id: str = Field(...)
 
 
 class SocialAccountCreate(BaseModel):
@@ -49,6 +62,7 @@ class ContentAssetCreate(BaseModel):
     file_name: Optional[str] = None
     file_size: Optional[int] = None
     description: Optional[str] = None
+    storage_key: Optional[str] = None
 
 
 class ContentAsset(ContentAssetCreate):
@@ -226,10 +240,26 @@ def health_check() -> Dict[str, str]:
     return {"status": "ok"}
 
 
-@app.post("/api/v1/business-profiles/", response_model=BusinessProfile)
+@app.get("/ready")
+def readiness_check() -> Dict[str, str]:
+    get_settings()
+    return {"status": "configured"}
+
+
+@app.post("/api/v1/business-profile", response_model=BusinessProfile)
+@app.post("/api/v1/business-profiles/", response_model=BusinessProfile, include_in_schema=False)
 def create_business_profile(payload: BusinessProfileCreate) -> BusinessProfile:
+    user_id = payload.user_id or str(uuid4())
+    existing_profile = next(
+        (profile for profile in business_profiles_db.values() if profile["user_id"] == user_id),
+        None,
+    )
+    if existing_profile:
+        return BusinessProfile(**existing_profile)
+
     profile_id = str(uuid4())
-    profile = BusinessProfile(id=profile_id, **payload.model_dump())
+    profile_data = payload.model_dump(exclude={"user_id"})
+    profile = BusinessProfile(id=profile_id, user_id=user_id, **profile_data)
     business_profiles_db[profile_id] = profile.model_dump()
     return profile
 
@@ -269,6 +299,69 @@ def create_content_asset(profile_id: str, payload: ContentAssetCreate) -> Conten
         **payload.model_dump(),
     )
     content_assets_db[asset_id] = asset.model_dump()
+    return asset
+
+
+@app.post(
+    "/api/v1/business-profiles/{profile_id}/media-assets",
+    response_model=ContentAsset,
+)
+async def upload_media_asset(profile_id: str, file: UploadFile = File(...)) -> ContentAsset:
+    if profile_id not in business_profiles_db:
+        raise HTTPException(status_code=404, detail="Business profile not found")
+
+    settings = get_settings()
+    allowed_types = {
+        "image/jpeg": ("image", ".jpg"),
+        "image/png": ("image", ".png"),
+        "image/webp": ("image", ".webp"),
+        "video/mp4": ("video", ".mp4"),
+        "video/quicktime": ("video", ".mov"),
+        "video/webm": ("video", ".webm"),
+    }
+    media_type = (file.content_type or "").lower()
+    if media_type not in allowed_types:
+        raise HTTPException(status_code=415, detail="Upload must be a JPEG, PNG, WebP, MP4, MOV, or WebM file")
+
+    asset_type, extension = allowed_types[media_type]
+    asset_id = str(uuid4())
+    storage_key = f"{asset_id}{extension}"
+    storage_dir = Path(settings.media_storage_dir).resolve()
+    storage_dir.mkdir(parents=True, exist_ok=True)
+    destination = storage_dir / storage_key
+    total_size = 0
+    checksum = sha256()
+
+    try:
+        with destination.open("wb") as destination_file:
+            while chunk := await file.read(1024 * 1024):
+                total_size += len(chunk)
+                if total_size > settings.max_upload_bytes:
+                    raise HTTPException(status_code=413, detail="File exceeds the configured upload size limit")
+                checksum.update(chunk)
+                destination_file.write(chunk)
+    except Exception:
+        destination.unlink(missing_ok=True)
+        raise
+    finally:
+        await file.close()
+
+    original_name = Path(file.filename or "upload").name[:255]
+    profile = business_profiles_db[profile_id]
+    asset = ContentAsset(
+        id=asset_id,
+        business_profile_id=profile_id,
+        asset_type=asset_type,
+        title=Path(original_name).stem or f"{profile['business_name']} {asset_type}",
+        file_name=original_name,
+        file_size=total_size,
+        media_url=None,
+        storage_key=storage_key,
+    )
+    stored_asset = asset.model_dump()
+    stored_asset["mime_type"] = media_type
+    stored_asset["sha256"] = checksum.hexdigest()
+    content_assets_db[asset_id] = stored_asset
     return asset
 
 
