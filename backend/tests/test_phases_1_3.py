@@ -345,3 +345,15 @@ def test_orm_metadata_includes_persistence_entities_and_password_free_sessions()
         "last_used_at",
         "device_label",
     }
+
+
+def test_apk_download_page_is_served_and_missing_apk_is_clear():
+    page_response = client.get("/download")
+    apk_response = client.get("/download/LocalBiz.apk")
+
+    assert page_response.status_code == 200
+    assert "LocalBiz Growth" in page_response.text
+    assert "http://140.238.91.204" in page_response.text
+    assert "APK build is not available yet" in page_response.text
+    assert apk_response.status_code == 404
+    assert apk_response.json()["detail"] == "Android APK has not been built yet"

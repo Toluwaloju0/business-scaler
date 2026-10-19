@@ -8,6 +8,7 @@ from typing import Any, Dict, List, Optional
 from uuid import uuid4
 
 from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi.responses import FileResponse, HTMLResponse
 from pydantic import BaseModel, Field
 
 from app.settings import get_settings
@@ -18,7 +19,8 @@ async def lifespan(_: FastAPI):
     yield
 
 app = FastAPI(title="LocalBiz Social Growth App", version="0.1.0", lifespan=lifespan)
-app = FastAPI(title="LocalBiz Social Growth App", version="0.1.0")
+
+APK_FILE_PATH = Path(__file__).resolve().parent.parent / "frontend" / "builds" / "LocalBiz-preview.apk"
 
 
 business_profiles_db: Dict[str, Dict[str, Any]] = {}
@@ -244,6 +246,65 @@ def health_check() -> Dict[str, str]:
 def readiness_check() -> Dict[str, str]:
     get_settings()
     return {"status": "configured"}
+
+
+@app.get("/download", response_class=HTMLResponse)
+def apk_download_page() -> HTMLResponse:
+        apk_available = APK_FILE_PATH.is_file()
+        download_action = (
+                '<a class="download" href="/download/LocalBiz.apk">Download Android APK</a>'
+                if apk_available
+                else '<span class="download disabled">APK build is not available yet</span>'
+        )
+        availability_message = (
+                "The Android installer is ready to download. Open this page on your Android device and tap the button."
+                if apk_available
+                else "The download page is ready, but no APK has been built and placed on this server yet."
+        )
+        content = f"""<!doctype html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="theme-color" content="#e4efe8">
+    <title>LocalBiz Growth - Android app</title>
+    <style>
+        :root {{ color-scheme: light; font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; background: #f2f6f3; color: #18392b; }}
+        * {{ box-sizing: border-box; }}
+        body {{ margin: 0; min-height: 100vh; display: grid; place-items: center; padding: 24px; }}
+        main {{ width: min(100%, 560px); background: #fff; border: 1px solid #dce6df; border-radius: 12px; padding: 32px; box-shadow: 0 18px 50px #18392b12; }}
+        .mark {{ display: grid; place-items: center; width: 56px; height: 56px; border-radius: 14px; background: #27794f; color: white; font-weight: 800; font-size: 24px; }}
+        h1 {{ margin: 22px 0 8px; font-size: 30px; }}
+        p {{ color: #52675c; line-height: 1.6; }}
+        .status {{ padding: 14px 16px; margin: 22px 0; border-radius: 8px; background: #eef4f0; color: #355442; }}
+        .download {{ display: flex; justify-content: center; align-items: center; min-height: 52px; margin-top: 20px; border-radius: 8px; background: #27794f; color: white; font-weight: 700; text-decoration: none; }}
+        .download.disabled {{ background: #dce6df; color: #52675c; cursor: not-allowed; }}
+        .note {{ font-size: 13px; margin-top: 24px; }}
+    </style>
+</head>
+<body>
+    <main>
+        <div class="mark" aria-hidden="true">L</div>
+        <h1>LocalBiz Growth</h1>
+        <p>Install the Android app to prepare local business content and upload media for your video ideas.</p>
+        <div class="status">{availability_message}</div>
+        {download_action}
+        <p class="note">Android may ask you to allow installation from this browser. Only install this APK if you trust the source. The app connects to the LocalBiz backend at http://140.238.91.204.</p>
+    </main>
+</body>
+</html>"""
+        return HTMLResponse(content=content)
+
+
+@app.get("/download/LocalBiz.apk", include_in_schema=False)
+def download_android_apk() -> FileResponse:
+        if not APK_FILE_PATH.is_file():
+                raise HTTPException(status_code=404, detail="Android APK has not been built yet")
+        return FileResponse(
+                path=APK_FILE_PATH,
+                media_type="application/vnd.android.package-archive",
+                filename="LocalBiz-Growth.apk",
+        )
 
 
 @app.post("/api/v1/business-profile", response_model=BusinessProfile)
