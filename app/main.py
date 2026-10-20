@@ -5,17 +5,24 @@ from contextlib import asynccontextmanager
 from hashlib import sha256
 from pathlib import Path
 from typing import Any, Dict, List, Optional
-from uuid import uuid4
+from uuid import UUID, uuid4
 
-from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi import Depends, FastAPI, File, HTTPException, UploadFile
 from fastapi.responses import FileResponse, HTMLResponse
 from pydantic import BaseModel, Field
+from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
+from sqlalchemy.orm import Session
 
+from app.database import create_database_tables, get_db_session, test_database_connection
+from app.models import Business, BusinessMembership, ContentAsset as ContentAssetModel, SocialAccount as SocialAccountModel, User
 from app.settings import get_settings
+
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     get_settings()
+    create_database_tables()
     yield
 
 app = FastAPI(title="LocalBiz Social Growth App", version="0.1.0", lifespan=lifespan)
@@ -23,13 +30,8 @@ app = FastAPI(title="LocalBiz Social Growth App", version="0.1.0", lifespan=life
 APK_FILE_PATH = Path(__file__).resolve().parent.parent / "frontend" / "builds" / "LocalBiz-preview.apk"
 
 
-business_profiles_db: Dict[str, Dict[str, Any]] = {}
-social_accounts_db: Dict[str, Dict[str, Any]] = {}
-content_assets_db: Dict[str, Dict[str, Any]] = {}
-
-
 class BusinessProfileCreate(BaseModel):
-    user_id: Optional[str] = Field(default=None, min_length=1)
+    user_id: Optional[str] = Field(default=None, min_length=1, max_length=128)
     business_name: str = Field(..., min_length=2)
     niche: str = Field(..., min_length=2)
     location: str = Field(..., min_length=2)
@@ -54,6 +56,7 @@ class SocialAccountCreate(BaseModel):
 class SocialAccount(SocialAccountCreate):
     id: str
     business_profile_id: str
+    access_token: None = None
 
 
 class ContentAssetCreate(BaseModel):
@@ -64,6 +67,8 @@ class ContentAssetCreate(BaseModel):
     file_name: Optional[str] = None
     file_size: Optional[int] = None
     description: Optional[str] = None
+    mime_type: Optional[str] = None
+    sha256: Optional[str] = None
     storage_key: Optional[str] = None
 
 
@@ -237,6 +242,44 @@ def _build_platform_suggestions(
     return suggestions
 
 
+def _profile_response(business: Business) -> BusinessProfile:
+    return BusinessProfile(
+        id=str(business.id),
+        user_id=business.owner_user_id,
+        business_name=business.name,
+        niche=business.niche,
+        location=business.location,
+        service_offerings=business.service_offerings,
+        target_audience=business.target_audience,
+        brand_tone=business.brand_tone,
+        posting_goals=business.posting_goals,
+    )
+
+
+def _asset_response(asset: ContentAssetModel) -> ContentAsset:
+    return ContentAsset(
+        id=str(asset.id),
+        business_profile_id=str(asset.business_id),
+        asset_type=asset.asset_type,
+        title=asset.title,
+        source_text=asset.source_text,
+        media_url=None,
+        file_name=asset.original_filename,
+        file_size=asset.byte_size,
+        description=asset.description,
+        mime_type=asset.mime_type,
+        sha256=asset.sha256,
+        storage_key=asset.object_key,
+    )
+
+
+def _profile_uuid(profile_id: str) -> UUID:
+    try:
+        return UUID(profile_id)
+    except ValueError:
+        raise HTTPException(status_code=404, detail="Business profile not found") from None
+
+
 @app.get("/health")
 def health_check() -> Dict[str, str]:
     return {"status": "ok"}
@@ -244,8 +287,11 @@ def health_check() -> Dict[str, str]:
 
 @app.get("/ready")
 def readiness_check() -> Dict[str, str]:
-    get_settings()
-    return {"status": "configured"}
+    try:
+        test_database_connection()
+    except RuntimeError:
+        raise HTTPException(status_code=503, detail="Database is unavailable") from None
+    return {"status": "ready", "database": "connected"}
 
 
 @app.get("/download", response_class=HTMLResponse)
@@ -309,66 +355,159 @@ def download_android_apk() -> FileResponse:
 
 @app.post("/api/v1/business-profile", response_model=BusinessProfile)
 @app.post("/api/v1/business-profiles/", response_model=BusinessProfile, include_in_schema=False)
-def create_business_profile(payload: BusinessProfileCreate) -> BusinessProfile:
+def create_business_profile(
+    payload: BusinessProfileCreate,
+    db: Session = Depends(get_db_session),
+) -> BusinessProfile:
     user_id = payload.user_id or str(uuid4())
-    existing_profile = next(
-        (profile for profile in business_profiles_db.values() if profile["user_id"] == user_id),
-        None,
-    )
+    existing_profile = db.scalar(select(Business).where(Business.owner_user_id == user_id))
     if existing_profile:
-        return BusinessProfile(**existing_profile)
+        return _profile_response(existing_profile)
 
-    profile_id = str(uuid4())
-    profile_data = payload.model_dump(exclude={"user_id"})
-    profile = BusinessProfile(id=profile_id, user_id=user_id, **profile_data)
-    business_profiles_db[profile_id] = profile.model_dump()
-    return profile
+    user = db.get(User, user_id)
+    if user is None:
+        user = User(id=user_id)
+        db.add(user)
+
+    business = Business(
+        owner_user_id=user_id,
+        name=payload.business_name,
+        niche=payload.niche,
+        location=payload.location,
+        service_offerings=payload.service_offerings,
+        target_audience=payload.target_audience,
+        brand_tone=payload.brand_tone,
+        posting_goals=payload.posting_goals,
+    )
+    db.add(business)
+    try:
+        db.flush()
+        db.add(BusinessMembership(user_id=user_id, business_id=business.id, role="owner"))
+        db.commit()
+        db.refresh(business)
+    except IntegrityError:
+        db.rollback()
+        concurrent_profile = db.scalar(select(Business).where(Business.owner_user_id == user_id))
+        if concurrent_profile is None:
+            raise HTTPException(status_code=409, detail="Could not create the business profile") from None
+        return _profile_response(concurrent_profile)
+    return _profile_response(business)
 
 
 @app.get("/api/v1/business-profiles/{profile_id}", response_model=BusinessProfile)
-def get_business_profile(profile_id: str) -> BusinessProfile:
-    profile = business_profiles_db.get(profile_id)
-    if not profile:
+def get_business_profile(profile_id: str, db: Session = Depends(get_db_session)) -> BusinessProfile:
+    business = db.get(Business, _profile_uuid(profile_id))
+    if business is None:
         raise HTTPException(status_code=404, detail="Business profile not found")
-    return BusinessProfile(**profile)
+    return _profile_response(business)
 
 
 @app.post("/api/v1/business-profiles/{profile_id}/social-accounts", response_model=SocialAccount)
-def create_social_account(profile_id: str, payload: SocialAccountCreate) -> SocialAccount:
-    if profile_id not in business_profiles_db:
+def create_social_account(
+    profile_id: str,
+    payload: SocialAccountCreate,
+    db: Session = Depends(get_db_session),
+) -> SocialAccount:
+    business_id = _profile_uuid(profile_id)
+    if db.get(Business, business_id) is None:
         raise HTTPException(status_code=404, detail="Business profile not found")
 
-    account_id = str(uuid4())
-    account = SocialAccount(
-        id=account_id,
-        business_profile_id=profile_id,
-        **payload.model_dump(),
+    account = db.scalar(
+        select(SocialAccountModel).where(
+            SocialAccountModel.business_id == business_id,
+            SocialAccountModel.platform == payload.platform,
+            SocialAccountModel.external_account_id == payload.account_name,
+        )
     )
-    social_accounts_db[account_id] = account.model_dump()
-    return account
+    if account is None:
+        account = SocialAccountModel(
+            business_id=business_id,
+            platform=payload.platform,
+            external_account_id=payload.account_name,
+            account_name=payload.account_name,
+            connection_state=payload.status,
+            granted_scopes=[],
+            token_ciphertext=None,
+        )
+        db.add(account)
+    else:
+        account.connection_state = payload.status
+
+    db.commit()
+    db.refresh(account)
+    return SocialAccount(
+        id=str(account.id),
+        business_profile_id=str(account.business_id),
+        platform=account.platform,
+        account_name=account.account_name,
+        status=account.connection_state,
+        access_token=None,
+    )
+
+
+@app.get("/api/v1/business-profiles/{profile_id}/social-accounts", response_model=List[SocialAccount])
+def list_social_accounts(profile_id: str, db: Session = Depends(get_db_session)) -> List[SocialAccount]:
+    business_id = _profile_uuid(profile_id)
+    if db.get(Business, business_id) is None:
+        raise HTTPException(status_code=404, detail="Business profile not found")
+    accounts = db.scalars(
+        select(SocialAccountModel)
+        .where(SocialAccountModel.business_id == business_id)
+        .order_by(SocialAccountModel.created_at.desc())
+    ).all()
+    return [
+        SocialAccount(
+            id=str(account.id),
+            business_profile_id=str(account.business_id),
+            platform=account.platform,
+            account_name=account.account_name,
+            status=account.connection_state,
+            access_token=None,
+        )
+        for account in accounts
+    ]
 
 
 @app.post("/api/v1/business-profiles/{profile_id}/content-assets", response_model=ContentAsset)
-def create_content_asset(profile_id: str, payload: ContentAssetCreate) -> ContentAsset:
-    if profile_id not in business_profiles_db:
+def create_content_asset(
+    profile_id: str,
+    payload: ContentAssetCreate,
+    db: Session = Depends(get_db_session),
+) -> ContentAsset:
+    business_id = _profile_uuid(profile_id)
+    if db.get(Business, business_id) is None:
         raise HTTPException(status_code=404, detail="Business profile not found")
 
-    asset_id = str(uuid4())
-    asset = ContentAsset(
-        id=asset_id,
-        business_profile_id=profile_id,
-        **payload.model_dump(),
+    asset = ContentAssetModel(
+        business_id=business_id,
+        asset_type=payload.asset_type,
+        title=payload.title,
+        source_text=payload.source_text,
+        description=payload.description,
+        original_filename=payload.file_name,
+        mime_type=payload.mime_type,
+        byte_size=payload.file_size,
+        sha256=payload.sha256,
+        object_key=payload.storage_key,
+        status="ready",
     )
-    content_assets_db[asset_id] = asset.model_dump()
-    return asset
+    db.add(asset)
+    db.commit()
+    db.refresh(asset)
+    return _asset_response(asset)
 
 
 @app.post(
     "/api/v1/business-profiles/{profile_id}/media-assets",
     response_model=ContentAsset,
 )
-async def upload_media_asset(profile_id: str, file: UploadFile = File(...)) -> ContentAsset:
-    if profile_id not in business_profiles_db:
+async def upload_media_asset(
+    profile_id: str,
+    file: UploadFile = File(...),
+    db: Session = Depends(get_db_session),
+) -> ContentAsset:
+    business_id = _profile_uuid(profile_id)
+    if db.get(Business, business_id) is None:
         raise HTTPException(status_code=404, detail="Business profile not found")
 
     settings = get_settings()
@@ -408,54 +547,86 @@ async def upload_media_asset(profile_id: str, file: UploadFile = File(...)) -> C
         await file.close()
 
     original_name = Path(file.filename or "upload").name[:255]
-    profile = business_profiles_db[profile_id]
-    asset = ContentAsset(
-        id=asset_id,
-        business_profile_id=profile_id,
+    asset = ContentAssetModel(
+        id=UUID(asset_id),
+        business_id=business_id,
         asset_type=asset_type,
-        title=Path(original_name).stem or f"{profile['business_name']} {asset_type}",
-        file_name=original_name,
-        file_size=total_size,
-        media_url=None,
-        storage_key=storage_key,
+        title=Path(original_name).stem or f"Business {asset_type}",
+        original_filename=original_name,
+        mime_type=media_type,
+        byte_size=total_size,
+        sha256=checksum.hexdigest(),
+        object_key=storage_key,
+        status="ready",
     )
-    stored_asset = asset.model_dump()
-    stored_asset["mime_type"] = media_type
-    stored_asset["sha256"] = checksum.hexdigest()
-    content_assets_db[asset_id] = stored_asset
-    return asset
+    try:
+        db.add(asset)
+        db.commit()
+        db.refresh(asset)
+        return _asset_response(asset)
+    except Exception:
+        db.rollback()
+        destination.unlink(missing_ok=True)
+        raise
 
 
 @app.get("/api/v1/business-profiles/{profile_id}/content-assets", response_model=List[ContentAsset])
-def list_content_assets(profile_id: str) -> List[ContentAsset]:
-    if profile_id not in business_profiles_db:
+def list_content_assets(profile_id: str, db: Session = Depends(get_db_session)) -> List[ContentAsset]:
+    business_id = _profile_uuid(profile_id)
+    if db.get(Business, business_id) is None:
         raise HTTPException(status_code=404, detail="Business profile not found")
-    return [
-        ContentAsset(**asset)
-        for asset in content_assets_db.values()
-        if asset["business_profile_id"] == profile_id
-    ]
+    assets = db.scalars(
+        select(ContentAssetModel)
+        .where(ContentAssetModel.business_id == business_id)
+        .order_by(ContentAssetModel.created_at.desc())
+    ).all()
+    return [_asset_response(asset) for asset in assets]
 
 
 @app.post("/api/v1/content-suggestions/generate")
-def generate_content_suggestions(payload: ContentSuggestionRequest) -> Dict[str, Any]:
-    if payload.business_profile_id not in business_profiles_db:
+def generate_content_suggestions(
+    payload: ContentSuggestionRequest,
+    db: Session = Depends(get_db_session),
+) -> Dict[str, Any]:
+    business_id = _profile_uuid(payload.business_profile_id)
+    business = db.get(Business, business_id)
+    if business is None:
         raise HTTPException(status_code=404, detail="Business profile not found")
 
-    profile = business_profiles_db[payload.business_profile_id]
-    profile_assets = [
-        asset
-        for asset in content_assets_db.values()
-        if asset["business_profile_id"] == payload.business_profile_id
-    ]
+    profile = {
+        "business_name": business.name,
+        "niche": business.niche,
+        "location": business.location,
+        "service_offerings": business.service_offerings,
+        "target_audience": business.target_audience,
+        "brand_tone": business.brand_tone,
+        "posting_goals": business.posting_goals,
+    }
+    asset_query = select(ContentAssetModel).where(ContentAssetModel.business_id == business_id)
     if payload.asset_ids is not None:
-        requested_ids = set(payload.asset_ids)
-        profile_asset_ids = {asset["id"] for asset in profile_assets}
-        if not requested_ids.issubset(profile_asset_ids):
+        try:
+            requested_ids = {UUID(asset_id) for asset_id in payload.asset_ids}
+        except ValueError:
             raise HTTPException(status_code=404, detail="One or more selected assets were not found")
-        profile_assets = [asset for asset in profile_assets if asset["id"] in requested_ids]
+        asset_query = asset_query.where(ContentAssetModel.id.in_(requested_ids))
 
-    ranked_assets = _rank_assets(profile, profile_assets)
+    profile_assets = db.scalars(asset_query).all()
+    if payload.asset_ids is not None and len(profile_assets) != len(set(payload.asset_ids)):
+        raise HTTPException(status_code=404, detail="One or more selected assets were not found")
+
+    asset_payloads = [
+        {
+            "id": str(asset.id),
+            "asset_type": asset.asset_type,
+            "title": asset.title,
+            "source_text": asset.source_text,
+            "description": asset.description,
+            "media_url": asset.object_key,
+        }
+        for asset in profile_assets
+    ]
+
+    ranked_assets = _rank_assets(profile, asset_payloads)
     trend_format = _choose_trend_format(payload.trend_format, ranked_assets)
     platforms_payload = [
         {
@@ -466,7 +637,7 @@ def generate_content_suggestions(payload: ContentSuggestionRequest) -> Dict[str,
     ]
 
     return {
-        "business_profile_id": payload.business_profile_id,
+        "business_profile_id": str(business.id),
         "selected_assets": ranked_assets,
         "trend_insight": {
             "format": trend_format,

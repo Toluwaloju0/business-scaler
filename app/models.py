@@ -46,6 +46,9 @@ class Business(Base):
     __tablename__ = "businesses"
 
     id: Mapped[UUID] = mapped_column(Uuid, primary_key=True, default=uuid4)
+    owner_user_id: Mapped[str] = mapped_column(
+        ForeignKey("users.id", ondelete="CASCADE"), unique=True, nullable=False, index=True
+    )
     name: Mapped[str] = mapped_column(String(200), nullable=False)
     niche: Mapped[str] = mapped_column(String(160), nullable=False)
     location: Mapped[str] = mapped_column(String(200), nullable=False)
@@ -59,6 +62,7 @@ class Business(Base):
 
     memberships: Mapped[list[BusinessMembership]] = relationship(back_populates="business", cascade="all, delete-orphan")
     assets: Mapped[list[ContentAsset]] = relationship(back_populates="business", cascade="all, delete-orphan")
+    owner: Mapped[User] = relationship(foreign_keys=[owner_user_id])
 
 
 class BusinessMembership(Base):

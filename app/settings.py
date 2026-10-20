@@ -25,8 +25,8 @@ class Settings(BaseSettings):
             raise ValueError("DATABASE_URL is required and cannot be blank")
 
         parsed = urlsplit(value)
-        if parsed.scheme not in {"postgresql", "postgresql+psycopg"}:
-            raise ValueError("DATABASE_URL must use PostgreSQL (postgresql:// or postgresql+psycopg://)")
+        if parsed.scheme not in {"postgresql", "postgresql+psycopg2"}:
+            raise ValueError("DATABASE_URL must use PostgreSQL (postgresql:// or postgresql+psycopg2://)")
         if not parsed.hostname or not parsed.path.strip("/"):
             raise ValueError("DATABASE_URL must include a host and database name")
         return value

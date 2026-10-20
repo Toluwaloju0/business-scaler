@@ -1,12 +1,34 @@
 import os
 
 from fastapi.testclient import TestClient
+from sqlalchemy import create_engine
+from sqlalchemy.orm import Session, sessionmaker
+from sqlalchemy.pool import StaticPool
 
 os.environ.setdefault("DATABASE_URL", "postgresql+psycopg://test:test@localhost/test_db")
 
+from app.database import get_db_session
 from app.main import app
+from app.models import Base
 
 client = TestClient(app)
+
+test_engine = create_engine(
+    "sqlite+pysqlite://",
+    connect_args={"check_same_thread": False},
+    poolclass=StaticPool,
+)
+test_tables = [table for table in Base.metadata.sorted_tables if table.name != "content_chunks"]
+Base.metadata.create_all(test_engine, tables=test_tables)
+TestSession = sessionmaker(bind=test_engine, autoflush=False, expire_on_commit=False)
+
+
+def override_db_session():
+    with TestSession() as session:
+        yield session
+
+
+app.dependency_overrides[get_db_session] = override_db_session
 
 
 def test_business_profile_creation_and_fetch():
@@ -327,6 +349,27 @@ def test_database_settings_require_postgresql_url():
         DATABASE_URL="postgresql+psycopg://test:test@localhost/test_db",
     )
     assert settings.database_url.get_secret_value().startswith("postgresql+psycopg://")
+
+
+def test_database_connectivity_check_and_table_initializer(monkeypatch):
+    from sqlalchemy import create_engine, inspect
+    from sqlalchemy.pool import StaticPool
+
+    import app.database as database
+
+    engine = create_engine(
+        "sqlite+pysqlite://",
+        connect_args={"check_same_thread": False},
+        poolclass=StaticPool,
+    )
+    monkeypatch.setattr(database, "get_engine", lambda: engine)
+
+    assert database.test_database_connection() is True
+    database.create_database_tables()
+
+    table_names = set(inspect(engine).get_table_names())
+    assert {"users", "businesses", "business_memberships", "content_assets"}.issubset(table_names)
+    assert "content_chunks" not in table_names
 
 
 def test_orm_metadata_includes_persistence_entities_and_password_free_sessions():
