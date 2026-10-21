@@ -16,7 +16,11 @@ from sqlalchemy.orm import Session
 
 from app.database import create_database_tables, get_db_session, test_database_connection
 from app.models import Business, BusinessMembership, ContentAsset as ContentAssetModel, SocialAccount as SocialAccountModel, User
+from app.media_processing import enqueue_video_analysis
 from app.settings import get_settings
+
+import logging
+logger = logging.getLogger(__name__)
 
 
 @asynccontextmanager
@@ -531,12 +535,14 @@ async def upload_media_asset(
     destination = storage_dir / storage_key
     total_size = 0
     checksum = sha256()
+    logger.info("trying the upload now checking file size")
 
     try:
         with destination.open("wb") as destination_file:
             while chunk := await file.read(1024 * 1024):
                 total_size += len(chunk)
                 if total_size > settings.max_upload_bytes:
+                    print("file size exceeds {} \n raising 413 error now".format(settings.max_upload_bytes))
                     raise HTTPException(status_code=413, detail="File exceeds the configured upload size limit")
                 checksum.update(chunk)
                 destination_file.write(chunk)
@@ -561,6 +567,8 @@ async def upload_media_asset(
     )
     try:
         db.add(asset)
+        if asset_type == "video":
+            enqueue_video_analysis(db, asset)
         db.commit()
         db.refresh(asset)
         return _asset_response(asset)

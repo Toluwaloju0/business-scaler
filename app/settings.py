@@ -11,6 +11,10 @@ class Settings(BaseSettings):
     database_url: SecretStr = Field(validation_alias="DATABASE_URL")
     media_storage_dir: str = "./media"
     max_upload_bytes: int = 100 * 1024 * 1024
+    gemma_model_path: str = "./models/gemma-4-E4B-it"
+    gemma_model_repo_id: str = "google/gemma-4-E4B-it"
+    video_frame_interval_seconds: int = 5
+    video_max_frames: int = 12
 
     model_config = SettingsConfigDict(
         env_file=".env",

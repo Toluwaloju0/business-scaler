@@ -9,6 +9,7 @@ package-lock.json
 dist/
 .pytest_cache/
 media/
+models/
 *.apk
 .env
 .env.*
