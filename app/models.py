@@ -192,6 +192,24 @@ class GeneratedDraft(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, nullable=False)
 
 
+class GeneratedContent(Base):
+    """Generated copy and media briefs saved in a business's content library."""
+    __tablename__ = "generated_contents"
+    __table_args__ = (
+        Index("ix_generated_contents_business_created", "business_id", "created_at"),
+        CheckConstraint("content_type IN ('text', 'image', 'video')", name="ck_generated_contents_type"),
+    )
+
+    id: Mapped[UUID] = mapped_column(Uuid, primary_key=True, default=uuid4)
+    business_id: Mapped[UUID] = mapped_column(ForeignKey("businesses.id", ondelete="CASCADE"), nullable=False)
+    content_type: Mapped[str] = mapped_column(String(20), nullable=False)
+    title: Mapped[str] = mapped_column(String(240), nullable=False)
+    body: Mapped[str] = mapped_column(Text, nullable=False)
+    source_analysis_ids: Mapped[list[str]] = mapped_column(JSON, default=list, nullable=False)
+    model_version: Mapped[str | None] = mapped_column(String(160))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, nullable=False)
+
+
 class DraftAsset(Base):
     __tablename__ = "draft_assets"
     __table_args__ = (UniqueConstraint("draft_id", "asset_id", name="uq_draft_asset"),)
@@ -282,6 +300,21 @@ class ProcessingJob(Base):
     error_code: Mapped[str | None] = mapped_column(String(120))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, nullable=False)
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class ContentGenerationResult(Base):
+    """Connect a durable generation job to the saved content items it produced."""
+    __tablename__ = "content_generation_results"
+
+    job_id: Mapped[UUID] = mapped_column(
+        ForeignKey("processing_jobs.id", ondelete="CASCADE"), primary_key=True
+    )
+    business_id: Mapped[UUID] = mapped_column(
+        ForeignKey("businesses.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    content_type: Mapped[str] = mapped_column(String(20), nullable=False)
+    generated_content_ids: Mapped[list[str]] = mapped_column(JSON, default=list, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, nullable=False)
 
 
 class AuditEvent(Base):

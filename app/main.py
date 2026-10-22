@@ -2,9 +2,10 @@ from __future__ import annotations
 
 import re
 from contextlib import asynccontextmanager
+from datetime import datetime
 from hashlib import sha256
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Literal, Optional
 from uuid import UUID, uuid4
 
 from fastapi import Depends, FastAPI, File, HTTPException, UploadFile
@@ -15,7 +16,18 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.database import create_database_tables, get_db_session, test_database_connection
-from app.models import Business, BusinessMembership, ContentAsset as ContentAssetModel, SocialAccount as SocialAccountModel, User
+from app.models import (
+    AssetAnalysis,
+    Business,
+    BusinessMembership,
+    ContentAsset as ContentAssetModel,
+    ContentGenerationResult,
+    GeneratedContent as GeneratedContentModel,
+    ProcessingJob,
+    SocialAccount as SocialAccountModel,
+    User,
+)
+from app.content_generation import enqueue_content_generation
 from app.media_processing import enqueue_video_analysis
 from app.settings import get_settings
 
@@ -79,6 +91,11 @@ class ContentAssetCreate(BaseModel):
 class ContentAsset(ContentAssetCreate):
     id: str
     business_profile_id: str
+    content_generation_status: Literal[
+        "pending content generation",
+        "processing content generation",
+        "completed content generation",
+    ]
 
 
 class ContentSuggestionRequest(BaseModel):
@@ -86,6 +103,28 @@ class ContentSuggestionRequest(BaseModel):
     platforms: List[str] = Field(..., min_length=1)
     asset_ids: Optional[List[str]] = None
     trend_format: str = "auto"
+
+
+class ContentGenerationRequest(BaseModel):
+    content_type: Literal["text", "image", "video"]
+
+
+class GeneratedContentResponse(BaseModel):
+    id: str
+    business_profile_id: str
+    content_type: Literal["text", "image", "video"]
+    title: str
+    body: str
+    source_analysis_ids: List[str]
+    created_at: datetime
+
+
+class ContentGenerationJobResponse(BaseModel):
+    job_id: str
+    status: Literal["pending", "processing", "complete", "failed"]
+    content_type: Literal["text", "image", "video"]
+    items: List[GeneratedContentResponse] = Field(default_factory=list)
+    error_message: Optional[str] = None
 
 
 TREND_FORMATS = {
@@ -261,6 +300,13 @@ def _profile_response(business: Business) -> BusinessProfile:
 
 
 def _asset_response(asset: ContentAssetModel) -> ContentAsset:
+    analysis_complete = any(analysis.status == "complete" for analysis in asset.analyses)
+    if analysis_complete:
+        generation_status = "completed content generation"
+    elif asset.status in {"processing", "analyzing"}:
+        generation_status = "processing content generation"
+    else:
+        generation_status = "pending content generation"
     return ContentAsset(
         id=str(asset.id),
         business_profile_id=str(asset.business_id),
@@ -274,6 +320,7 @@ def _asset_response(asset: ContentAssetModel) -> ContentAsset:
         mime_type=asset.mime_type,
         sha256=asset.sha256,
         storage_key=asset.object_key,
+        content_generation_status=generation_status,
     )
 
 
@@ -589,6 +636,179 @@ def list_content_assets(profile_id: str, db: Session = Depends(get_db_session)) 
         .order_by(ContentAssetModel.created_at.desc())
     ).all()
     return [_asset_response(asset) for asset in assets]
+
+
+def _generated_content_response(item: GeneratedContentModel) -> GeneratedContentResponse:
+    return GeneratedContentResponse(
+        id=str(item.id),
+        business_profile_id=str(item.business_id),
+        content_type=item.content_type,
+        title=item.title,
+        body=item.body,
+        source_analysis_ids=item.source_analysis_ids,
+        created_at=item.created_at,
+    )
+
+
+@app.get(
+    "/api/v1/business-profiles/{profile_id}/generated-content",
+    response_model=List[GeneratedContentResponse],
+)
+def list_generated_content(
+    profile_id: str,
+    db: Session = Depends(get_db_session),
+) -> List[GeneratedContentResponse]:
+    business_id = _profile_uuid(profile_id)
+    if db.get(Business, business_id) is None:
+        print("raising exception")
+        raise HTTPException(status_code=404, detail="Business profile not found")
+    items = db.scalars(
+        select(GeneratedContentModel)
+        .where(GeneratedContentModel.business_id == business_id)
+        .order_by(GeneratedContentModel.created_at.desc())
+    ).all()
+    return [_generated_content_response(item) for item in items]
+
+
+@app.get(
+    "/api/v1/business-profiles/{profile_id}/generated-content/jobs",
+    response_model=List[ContentGenerationJobResponse],
+)
+def list_content_generation_jobs(
+    profile_id: str,
+    db: Session = Depends(get_db_session),
+) -> List[ContentGenerationJobResponse]:
+    business_id = _profile_uuid(profile_id)
+    if db.get(Business, business_id) is None:
+        raise HTTPException(status_code=404, detail="Business profile not found")
+    jobs = db.scalars(
+        select(ProcessingJob)
+        .where(
+            ProcessingJob.business_id == business_id,
+            ProcessingJob.job_type.like("generate_content_%"),
+        )
+        .order_by(ProcessingJob.created_at.desc())
+    ).all()
+    responses: list[ContentGenerationJobResponse] = []
+    for job in jobs:
+        content_type = job.job_type.removeprefix("generate_content_")
+        if content_type not in {"text", "image", "video"}:
+            continue
+        result = db.get(ContentGenerationResult, job.id)
+        ordered_items: list[GeneratedContentResponse] = []
+        if result is not None:
+            item_ids = [UUID(item_id) for item_id in result.generated_content_ids]
+            items = db.scalars(
+                select(GeneratedContentModel).where(GeneratedContentModel.id.in_(item_ids))
+            ).all() if item_ids else []
+            items_by_id = {str(item.id): item for item in items}
+            ordered_items = [
+                _generated_content_response(items_by_id[item_id])
+                for item_id in result.generated_content_ids
+                if item_id in items_by_id
+            ]
+        responses.append(ContentGenerationJobResponse(
+            job_id=str(job.id),
+            status=job.state,
+            content_type=content_type,  # type: ignore[arg-type]
+            items=ordered_items,
+            error_message=(
+                "Content generation failed after several attempts. Check that the local Gemma model is available."
+                if job.state == "failed"
+                else None
+            ),
+        ))
+    return responses
+
+
+@app.post(
+    "/api/v1/business-profiles/{profile_id}/generated-content/generate",
+    response_model=ContentGenerationJobResponse,
+    status_code=202,
+)
+def create_generated_content(
+    profile_id: str,
+    payload: ContentGenerationRequest,
+    db: Session = Depends(get_db_session),
+) -> ContentGenerationJobResponse:
+    business_id = _profile_uuid(profile_id)
+    business = db.get(Business, business_id)
+    if business is None:
+        raise HTTPException(status_code=404, detail="Business profile not found")
+
+    has_analysis = db.scalar(
+        select(AssetAnalysis.id)
+        .join(ContentAssetModel, AssetAnalysis.asset_id == ContentAssetModel.id)
+        .where(
+            ContentAssetModel.business_id == business_id,
+            AssetAnalysis.status == "complete",
+        )
+        .order_by(AssetAnalysis.created_at.desc())
+        .limit(1)
+    )
+    if has_analysis is None:
+        raise HTTPException(
+            status_code=409,
+            detail="Upload media and wait for its analysis before generating content.",
+        )
+
+    job = enqueue_content_generation(db, business_id, payload.content_type)
+    db.commit()
+    db.refresh(job)
+    return ContentGenerationJobResponse(
+        job_id=str(job.id),
+        status=job.state,
+        content_type=payload.content_type,
+    )
+
+
+@app.get(
+    "/api/v1/business-profiles/{profile_id}/generated-content/jobs/{job_id}",
+    response_model=ContentGenerationJobResponse,
+)
+def get_content_generation_job(
+    profile_id: str,
+    job_id: str,
+    db: Session = Depends(get_db_session),
+) -> ContentGenerationJobResponse:
+    business_id = _profile_uuid(profile_id)
+    try:
+        job_uuid = UUID(job_id)
+    except ValueError:
+        raise HTTPException(status_code=404, detail="Content generation job not found") from None
+    job = db.get(ProcessingJob, job_uuid)
+    if job is None or job.business_id != business_id or not job.job_type.startswith("generate_content_"):
+        raise HTTPException(status_code=404, detail="Content generation job not found")
+
+    content_type = job.job_type.removeprefix("generate_content_")
+    if content_type not in {"text", "image", "video"}:
+        raise HTTPException(status_code=500, detail="Content generation job has an invalid type")
+
+    result = db.get(ContentGenerationResult, job.id)
+    ordered_items: list[GeneratedContentResponse] = []
+    if result is not None:
+        item_ids = [UUID(item_id) for item_id in result.generated_content_ids]
+        items = db.scalars(
+            select(GeneratedContentModel).where(GeneratedContentModel.id.in_(item_ids))
+        ).all() if item_ids else []
+        items_by_id = {str(item.id): item for item in items}
+        ordered_items = [
+            _generated_content_response(items_by_id[item_id])
+            for item_id in result.generated_content_ids
+            if item_id in items_by_id
+        ]
+
+    return ContentGenerationJobResponse(
+        job_id=str(job.id),
+        status=job.state,
+        content_type=content_type,  # type: ignore[arg-type]
+        items=ordered_items,
+        error_message=(
+            "Content generation failed after several attempts. Check that the local Gemma model is available."
+            if job.state == "failed"
+            else None
+        ),
+    )
 
 
 @app.post("/api/v1/content-suggestions/generate")

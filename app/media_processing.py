@@ -267,8 +267,6 @@ def _call_gemma(video_path: Path) -> dict[str, Any]:
         import torch
         import time
 
-        start = time.now()
-
         with torch.inference_mode():
             outputs = model.generate(
                 **inputs,
@@ -276,8 +274,6 @@ def _call_gemma(video_path: Path) -> dict[str, Any]:
                 do_sample=False,
             )
         logger.info("The model has generated an output %s", outputs)
-        completion_time = time.now() = start
-        loggger.info("Time taken to complete generation of answers = %s seconds", completion_time)
         message = processor.decode(outputs[0][input_token_count:], skip_special_tokens=True).strip()
         if message.startswith("```"):
             message = message.removeprefix("```json").removeprefix("```").removesuffix("```").strip()
@@ -450,12 +446,23 @@ def process_one_video_job() -> bool:
 
 
 def run_worker() -> None:
-    """Poll PostgreSQL continuously and process video jobs one at a time."""
+    """Poll PostgreSQL and process queued video and content-generation jobs."""
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
-    logger.info("Video analysis worker started with local model at %s", get_settings().gemma_model_path)
+    from app.content_generation import process_one_content_generation_job
+
+    processors = [process_one_video_job, process_one_content_generation_job]
+    next_processor = 0
+    logger.info("Local media/content worker started with model at %s", get_settings().gemma_model_path)
     while True:
         try:
-            if not process_one_video_job():
+            did_work = False
+            for offset in range(len(processors)):
+                processor_index = (next_processor + offset) % len(processors)
+                if processors[processor_index]():
+                    did_work = True
+                    next_processor = (processor_index + 1) % len(processors)
+                    break
+            if not did_work:
                 logger.info("No job found in the database queue; sleeping for %s seconds", POLL_INTERVAL_SECONDS)
                 time.sleep(POLL_INTERVAL_SECONDS)
         except KeyboardInterrupt:
@@ -467,4 +474,9 @@ def run_worker() -> None:
 
 
 if __name__ == "__main__":
+    # Keep imports from content_generation on the same module instance when
+    # started with ``python -m app.media_processing`` so Gemma stays singleton.
+    import sys
+
+    sys.modules.setdefault("app.media_processing", sys.modules[__name__])
     run_worker()
